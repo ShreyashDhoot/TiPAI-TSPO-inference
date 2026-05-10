@@ -157,13 +157,19 @@ def run_inpainting(
     neg = _NEGATIVE.get(harm_class, "blurry, watermark, nsfw") + _NEGATIVE_SUFFIX
     gen = torch.Generator(device=device).manual_seed(knob.seed_offset)
 
+    # inversion_depth is an int in [1, 10] (KNOB_BOUNDS).
+    # SD inpaint `strength` must be a float in [0.0, 1.0].
+    # Map linearly: depth 1 → 0.3 (light repaint), depth 10 → 1.0 (full repaint).
+    strength = 0.3 + (knob.inversion_depth - 1) / 9.0 * 0.7   # [0.3, 1.0]
+    strength = float(max(0.0, min(1.0, strength)))              # hard clamp
+
     return inpaint_pipe(
-        prompt            = p,
-        negative_prompt   = neg,
-        image             = base_pil,
-        mask_image        = mask_pil,
-        guidance_scale    = max(knob.cfg_scale, 8.5),
-        strength          = max(knob.inversion_depth, 0.65),
+        prompt              = p,
+        negative_prompt     = neg,
+        image               = base_pil,
+        mask_image          = mask_pil,
+        guidance_scale      = max(knob.cfg_scale, 8.5),
+        strength            = strength,
         num_inference_steps = n_steps,
-        generator         = gen,
+        generator           = gen,
     ).images[0]

@@ -10,14 +10,16 @@ auditor.audit_pil(pil, prompt, t_norm) → AuditResult (TypedDict)
 
 AuditResult keys
 ----------------
-adv_prob      float   P(adversarial)  ∈ [0,1]
-is_unsafe     bool    adv_prob > 0.5
-harm_class    str     'safe' | 'nudity' | 'violence'
-policy_score  float   1 - adv_prob
-faithfulness  float   cos-similarity rescaled to [0,1]
-seam_quality  float   seam/blend quality score
-mask_pil      PIL.Image  binary inpaint mask (L mode, 512×512)
-heatmap       np.ndarray  raw adversarial heatmap (512×512, float32)
+adv_prob      float         P(adversarial)  ∈ [0,1]
+is_unsafe     bool          adv_prob > 0.5
+harm_class    str           'safe' | 'nudity' | 'violence'
+policy_score  float         1 - adv_prob
+faithfulness  float         cos-similarity rescaled to [0,1]
+seam_quality  float         seam/blend quality score
+mask_pil      PIL.Image     binary inpaint mask (L mode, 512×512)
+heatmap       np.ndarray    raw adversarial heatmap (512×512, float32)
+img_embed     torch.Tensor  (256,) auditor image embedding – used by StateEncoder
+text_embed    torch.Tensor  (512,) auditor text embedding  – used by StateEncoder
 """
 
 from __future__ import annotations
@@ -73,7 +75,11 @@ class SimpleTextEncoder(nn.Module):
         e = self.drop(self.embedding(toks))
         out, (h, _) = self.lstm(e)
         h = torch.cat([h[0], h[1]], dim=1)
-        return self.fc(h), self.norm(self.fc(out)), toks.eq(0)
+        # text_feat is (B, 512) — the raw encoder output used by StateEncoder
+        # seq_feat  is (B, T, 512) — used for cross-attention in the auditor head
+        text_feat = self.fc(h)
+        seq_feat  = self.norm(self.fc(out))
+        return text_feat, seq_feat, toks.eq(0)
 
 
 class CompleteMultiTaskAuditor(nn.Module):
@@ -116,15 +122,16 @@ class CompleteMultiTaskAuditor(nn.Module):
         feats = self.features(x)
         gf = F.adaptive_avg_pool2d(feats, (1, 1)).flatten(1)
 
-        img_embed = txt_embed = None
+        img_embed = txt_embed = txt_feat_raw = None
         if text_tokens is not None:
             tf, sf, pm = self.text_encoder(text_tokens)
             iq = self.image_proj(feats).view(B, 512, -1).permute(0, 2, 1)
             aq, _ = self.cross_attention(
                 self.query_norm(iq), self.key_norm(sf), self.key_norm(sf), key_padding_mask=pm
             )
-            img_embed = F.normalize(self.img_proj_head(aq.mean(1)), dim=-1)
-            txt_embed = F.normalize(self.txt_proj_head(tf), dim=-1)
+            img_embed    = F.normalize(self.img_proj_head(aq.mean(1)), dim=-1)  # (B, 256)
+            txt_embed    = F.normalize(self.txt_proj_head(tf), dim=-1)           # (B, 256) — for faithfulness
+            txt_feat_raw = tf                                                     # (B, 512) — for StateEncoder
 
         if timestep is not None:
             ts = self.timestep_embed(timestep)
@@ -142,8 +149,9 @@ class CompleteMultiTaskAuditor(nn.Module):
             "binary_logits":      F.adaptive_avg_pool2d(self.adv_head(feats), (1, 1)).flatten(1),
             "class_logits":       F.adaptive_avg_pool2d(self.class_head(feats), (1, 1)).flatten(1),
             "adversarial_map":    torch.sigmoid(self.adv_head(feats)),
-            "img_embed":          img_embed,
-            "txt_embed":          txt_embed,
+            "img_embed":          img_embed,       # (B, 256) — projected, for faithfulness
+            "txt_embed":          txt_embed,        # (B, 256) — projected, for faithfulness
+            "txt_feat_raw":       txt_feat_raw,     # (B, 512) — raw, for StateEncoder.text_proj
             "seam_quality_score": F.adaptive_avg_pool2d(seam_map, (1, 1)).flatten(1),
         }
 
@@ -160,7 +168,9 @@ class AuditResult(TypedDict):
     faithfulness: float
     seam_quality: float
     mask_pil:     Image.Image
-    heatmap:      np.ndarray
+    heatmap:      "np.ndarray"
+    img_embed:    "torch.Tensor"   # (256,) – auditor's own image embedding
+    text_embed:   "torch.Tensor"   # (512,) – auditor's own text embedding
 
 
 class AdversarialAuditor:
@@ -187,11 +197,10 @@ class AdversarialAuditor:
         self.tokenizer = SimpleTokenizer(vocab_path)
         vocab_size = len(self.tokenizer.word_to_idx)
 
-        self.model = CompleteMultiTaskAuditor(3, vocab_size)
-        state = torch.load(model_path, map_location=self.device)
-        if isinstance(state, dict):
-            state = state.get("state_dict", state.get("model_state_dict", state))
-        self.model.load_state_dict(state)
+        self.model = CompleteMultiTaskAuditor(num_classes=3, vocab_size=vocab_size)
+        self.model.load_state_dict(
+            torch.load(model_path, map_location=self.device), strict=False,
+        )
         self.model.to(self.device).eval()
 
         self._tfm = transforms.Compose([
@@ -200,7 +209,6 @@ class AdversarialAuditor:
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ])
 
-    @torch.no_grad()
     def audit_pil(
         self, pil: Image.Image, prompt: str = "", t_norm: float = 0.0
     ) -> AuditResult:
@@ -215,13 +223,15 @@ class AdversarialAuditor:
 
         Returns
         -------
-        AuditResult TypedDict
+        AuditResult TypedDict — includes img_embed (256-d) and text_embed (512-d)
+        for use by StateEncoder when building the policy state vector.
         """
         img_t = self._tfm(pil.convert("RGB")).unsqueeze(0).to(self.device)
         toks  = self.tokenizer.encode(prompt).unsqueeze(0).to(self.device)
         ts_t  = torch.tensor([[t_norm]], device=self.device, dtype=torch.float32)
 
-        out = self.model(img_t, text_tokens=toks, timestep=ts_t)
+        with torch.no_grad():
+            out = self.model(img_t, text_tokens=toks, timestep=ts_t)
 
         prob  = torch.sigmoid(out["binary_logits"]).item()
         cp    = F.softmax(out["class_logits"], dim=1)[0]
@@ -244,6 +254,17 @@ class AdversarialAuditor:
             ((feat > 0.5).astype(np.float32) * 255).astype(np.uint8)
         ).convert("L")
 
+        # text_embed is the RAW 512-d LSTM→fc output that StateEncoder.text_proj was trained on.
+        # txt_embed (256-d, post txt_proj_head) is only used internally for faithfulness scoring.
+        img_embed  = (
+            out["img_embed"][0].detach().cpu()    # (256,)
+            if out["img_embed"] is not None else torch.zeros(256)
+        )
+        text_embed = (
+            out["txt_feat_raw"][0].detach().cpu() # (512,) — matches StateEncoder.text_proj weight
+            if out["txt_feat_raw"] is not None else torch.zeros(512)
+        )
+
         return AuditResult(
             adv_prob     = prob,
             is_unsafe    = prob > 0.5,
@@ -253,4 +274,6 @@ class AdversarialAuditor:
             seam_quality = out["seam_quality_score"].item(),
             mask_pil     = mask_pil,
             heatmap      = hmap,
+            img_embed    = img_embed,
+            text_embed   = text_embed,
         )

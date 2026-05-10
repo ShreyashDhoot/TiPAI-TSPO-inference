@@ -1,19 +1,36 @@
 """
 policy/tspo_policy.py
 ─────────────────────
-TSPO policy: maps an 8-dim state vector to inpainting knob proposals.
+TSPO policy: maps a 257-dim state vector to inpainting knob proposals.
+
+Architecture exactly matches the training checkpoint (TSPO/src/config.py):
+  TEXT_DIM  = 512   (auditor LSTM text encoder output)
+  PROJ_DIM  = 64
+  LATENT_C  = 4
+  STATE_DIM = 4 * 64 + 1 = 257
+
+  StateEncoder inputs:
+    text_embed  (B, 512)     → text_proj  Linear(512→64)
+    latent      (B,4,H,W)    → latent_proj AdaptiveAvgPool2d(4)+Linear(64→64)
+    image_embed (B, 256)     → image_proj  Linear(256→64)
+    mask_mean   (B, 1)       → mask_proj   Linear(1→64)
+    t_norm      (B, 1)       → cat as-is
+    ─────────────────────────────────────────────────
+    output      (B, 257)
+
+  All embeddings come directly from AdversarialAuditor.audit_pil()
+  (img_embed, text_embed fields in AuditResult) — no CLIP needed.
+
+  The StateEncoder weights are saved separately by the training loop:
+    state_enc_step{N:05d}.pth  (bare state_dict, not wrapped in a dict)
+  Point encoder_checkpoint in config.yaml at the matching step file,
+  e.g. weights/state_enc_step00100.pth
 
 Public API
 ----------
-load_policy(ckpt_path, device)  → TSPOPolicy | None
-get_knobs(policy, audit_result, prompt_embed, t_norm, harm_class, n)
-    → list[KnobSet]
-
-KnobSet
--------
-cfg_scale       float   guidance scale for the inpainter
-inversion_depth float   strength parameter (0-1)
-seed_offset     int     generator seed
+load_policy(ckpt_path, device)         → TSPOPolicy | None
+load_state_encoder(ckpt_path, device)  → StateEncoder | None
+get_knobs(policy, state, n, device)    → list[KnobSet]
 """
 
 from __future__ import annotations
@@ -24,8 +41,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ── Architecture constants ────────────────────────────────────────────────────
-STATE_DIM        = 8
+# ── Architecture constants — must match TSPO/src/config.py ───────────────────
+TEXT_DIM         = 512   # auditor SimpleTextEncoder fc output
+PROJ_DIM         = 64
+LATENT_C         = 4
+STATE_DIM        = PROJ_DIM * 4 + 1   # 257
 NUM_CONTINUOUS   = 5
 NUM_SEED_BUCKETS = 10
 
@@ -34,12 +54,9 @@ KNOB_BOUNDS = {
     "mask_dilation":   (0.0,   1.0),
     "mask_feather":    (0.0,   1.0),
     "noise_jitter":    (0.0,   0.5),
-    "inversion_depth": (0.0,   1.0),
+    "inversion_depth": (1,     10),
 }
 
-HARM_CLASSES = ["safe", "nudity", "violence"]
-
-# vanilla fallback when policy is None
 _VANILLA_SWEEPS = [
     (9.0,  0.75,  42),
     (12.0, 0.90, 142),
@@ -55,29 +72,26 @@ def _denorm(x: float, lo: float, hi: float) -> float:
 @dataclass
 class KnobSet:
     cfg_scale:       float
-    inversion_depth: float
+    mask_dilation:   float
+    mask_feather:    float
+    noise_jitter:    float
+    inversion_depth: int
     seed_offset:     int
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Model definition
+# Policy network
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TSPOPolicy(nn.Module):
-    """
-    Stochastic policy over continuous inpainting knobs + discrete seed bucket.
-
-    Input : (B, STATE_DIM) state vector
-    Output: mean [B, NUM_CONTINUOUS], log_std [B, NUM_CONTINUOUS],
-            seed_logits [B, NUM_SEED_BUCKETS]
-    """
+    """Input: (B, 257)  Output: mean[B,5], log_std[B,5], seed_logits[B,10]"""
 
     def __init__(
         self,
-        state_dim:    int   = STATE_DIM,
-        hidden_dims:  tuple = (256, 128, 64),
-        log_std_min:  float = -4.0,
-        log_std_max:  float =  0.5,
+        state_dim:   int   = STATE_DIM,
+        hidden_dims: tuple = (256, 128, 64),
+        log_std_min: float = -4.0,
+        log_std_max: float =  0.5,
     ):
         super().__init__()
         self.log_std_min = log_std_min
@@ -103,33 +117,65 @@ class TSPOPolicy(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Public helpers
+# StateEncoder — mirrors TSPO/src/models/policy.py exactly
+# ─────────────────────────────────────────────────────────────────────────────
+
+class StateEncoder(nn.Module):
+    """
+    Encodes auditor outputs into the 257-dim state the policy was trained on.
+    No CLIP — all inputs come from AdversarialAuditor.audit_pil().
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.text_proj   = nn.Linear(TEXT_DIM, PROJ_DIM)           # 512 → 64
+        self.latent_proj = nn.Sequential(
+            nn.AdaptiveAvgPool2d(4), nn.Flatten(),
+            nn.Linear(4 * 4 * LATENT_C, PROJ_DIM), nn.ReLU(),     # 64  → 64
+        )
+        self.image_proj = nn.Linear(256, PROJ_DIM)                  # 256 → 64
+        self.mask_proj  = nn.Linear(1,   PROJ_DIM)                  # 1   → 64
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=0.1)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, text_embed, latent, image_embed, mask_mean, t_norm):
+        """
+        Args:
+            text_embed  : (B, 512)     – res_0["text_embed"].unsqueeze(0)
+            latent      : (B, 4, H, W) – current VAE latent (float32)
+            image_embed : (B, 256)     – res_0["img_embed"].unsqueeze(0)
+            mask_mean   : (B, 1)       – mean of binary mask [0,1]
+            t_norm      : (B, 1)       – timestep / 1000
+        Returns:
+            (B, 257)
+        """
+        p  = F.relu(self.text_proj(text_embed))     # (B, 64)
+        z  = F.relu(self.latent_proj(latent))        # (B, 64)
+        im = F.relu(self.image_proj(image_embed))    # (B, 64)
+        m  = F.relu(self.mask_proj(mask_mean))       # (B, 64)
+        return torch.cat([p, z, im, m, t_norm], dim=-1)  # (B, 257)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Loaders
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_policy(
     ckpt_path: str | None,
-    device: torch.device | str = "cpu",
-) -> TSPOPolicy | None:
-    """
-    Load a TSPOPolicy from a checkpoint file.
-
-    Parameters
-    ----------
-    ckpt_path : str | None  – path to .pth file; None → returns None (vanilla mode)
-    device    : torch.device | str
-
-    Returns
-    -------
-    TSPOPolicy in eval mode, or None if path is None / missing.
-    """
+    device: "torch.device | str" = "cpu",
+) -> "TSPOPolicy | None":
     if ckpt_path is None:
         return None
     if not os.path.exists(ckpt_path):
-        print(f"[TSPO] WARNING: checkpoint not found: {ckpt_path}")
+        print(f"[TSPO] WARNING: policy checkpoint not found: {ckpt_path}")
         return None
 
-    pol  = TSPOPolicy().to(device)
+    pol  = TSPOPolicy(state_dim=STATE_DIM).to(device)
     ckpt = torch.load(ckpt_path, map_location=device)
+    # training saves bare state_dict (policy.state_dict())
     state = ckpt.get("model_state_dict", ckpt)
     pol.load_state_dict(state)
     pol.eval()
@@ -138,80 +184,85 @@ def load_policy(
     return pol
 
 
-def _build_state(
-    audit_result: dict,
-    t_norm: float,
-    harm_class: str,
-    device: torch.device,
-) -> torch.Tensor:
-    """Build the 8-dim state vector from auditor output."""
-    onehot = [0.0, 0.0, 0.0]
-    if harm_class in HARM_CLASSES:
-        onehot[HARM_CLASSES.index(harm_class)] = 1.0
-    else:
-        onehot[0] = 1.0   # fallback to 'safe'
+def load_state_encoder(
+    ckpt_path: str | None,
+    device: "torch.device | str" = "cpu",
+) -> "StateEncoder | None":
+    """
+    Load StateEncoder from its own checkpoint.
 
-    vec = [
-        t_norm,
-        *onehot,
-        audit_result["faithfulness"],
-        audit_result["adv_prob"],
-        audit_result["seam_quality"],
-        0.0,   # reserved slot
-    ]
-    return torch.tensor(vec, dtype=torch.float32, device=device)
+    Training saves it as a bare state_dict:
+        torch.save(state_enc.encoder.state_dict(), "state_enc_step00100.pth")
 
+    Set encoder_checkpoint in config.yaml to that file path.
+    """
+    if ckpt_path is None:
+        print("[TSPO] encoder_checkpoint not set in config — running vanilla sweep.")
+        return None
+    if not os.path.exists(ckpt_path):
+        print(f"[TSPO] WARNING: encoder checkpoint not found: {ckpt_path}")
+        return None
+
+    enc   = StateEncoder().to(device)
+    state = torch.load(ckpt_path, map_location=device)
+    enc.load_state_dict(state)
+    enc.eval()
+    print(f"[TSPO] Loaded StateEncoder from {ckpt_path}")
+    return enc
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Knob generation
+# ─────────────────────────────────────────────────────────────────────────────
 
 def get_knobs(
-    policy:       TSPOPolicy | None,
-    audit_result: dict,
-    t_norm:       float,
-    harm_class:   str,
-    n:            int,
-    device:       torch.device | str = "cpu",
+    policy: "TSPOPolicy | None",
+    state:  "torch.Tensor | None",
+    n:      int,
+    device: "torch.device | str" = "cpu",
 ) -> list[KnobSet]:
     """
     Propose `n` KnobSet candidates.
 
-    When `policy` is None, returns the hardcoded vanilla sweep.
-
     Parameters
     ----------
-    policy       : loaded TSPOPolicy or None
-    audit_result : dict returned by AdversarialAuditor.audit_pil()
-    t_norm       : timestep normalised to [0,1]
-    harm_class   : 'nudity' | 'violence' | 'safe'
-    n            : number of candidates to produce
-    device       : torch device
-
-    Returns
-    -------
-    list[KnobSet]  length == n
+    policy : TSPOPolicy or None → vanilla sweep
+    state  : (STATE_DIM,) or (1, STATE_DIM) from StateEncoder. None → vanilla.
+    n      : number of candidates
     """
-    if policy is None:
-        base = _VANILLA_SWEEPS[:n]
+    if policy is None or state is None:
+        base  = _VANILLA_SWEEPS[:n]
         extra = [(10.0, 0.8, 42 + i * 100) for i in range(max(0, n - len(_VANILLA_SWEEPS)))]
-        raw = (base + extra)[:n]
-        return [KnobSet(cfg_scale=c, inversion_depth=inv, seed_offset=s) for c, inv, s in raw]
+        return [
+            KnobSet(
+                cfg_scale=c, mask_dilation=0.5, mask_feather=0.5,
+                noise_jitter=0.0,
+                inversion_depth=max(1, int(round(inv * 9 + 1))),
+                seed_offset=s,
+            )
+            for c, inv, s in (base + extra)[:n]
+        ]
 
     device = torch.device(device) if isinstance(device, str) else device
-    state = _build_state(audit_result, t_norm, harm_class, device)
-    state = state.unsqueeze(0).expand(n, -1)   # (n, STATE_DIM)
+    if state.dim() == 1:
+        state = state.unsqueeze(0)
+    state = state.to(device).expand(n, -1)
 
     with torch.no_grad():
         mean, log_std, seed_logits = policy(state)
-        std     = log_std.exp()
+        std      = log_std.exp()
         raw_cont = (mean + std * torch.randn_like(mean)).clamp(0.0, 1.0)
-        seeds    = torch.distributions.Categorical(
-            logits=seed_logits
-        ).sample()   # (n,)
+        seeds    = torch.distributions.Categorical(logits=seed_logits).sample()
 
     knobs = []
     for i in range(n):
         c = raw_cont[i].tolist()
         knobs.append(KnobSet(
             cfg_scale       = _denorm(c[0], *KNOB_BOUNDS["cfg_scale"]),
-            inversion_depth = max(0.05, _denorm(c[4], *KNOB_BOUNDS["inversion_depth"])),
-            seed_offset     = 42 + int(seeds[i].item()) * 100,
+            mask_dilation   = _denorm(c[1], *KNOB_BOUNDS["mask_dilation"]),
+            mask_feather    = _denorm(c[2], *KNOB_BOUNDS["mask_feather"]),
+            noise_jitter    = _denorm(c[3], *KNOB_BOUNDS["noise_jitter"]),
+            inversion_depth = max(1, int(round(_denorm(c[4], *KNOB_BOUNDS["inversion_depth"])))),
+            seed_offset     = int(seeds[i].item()) * 100,
         ))
     return knobs

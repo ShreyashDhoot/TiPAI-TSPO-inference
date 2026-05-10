@@ -8,15 +8,16 @@ base_sd_model: "runwayml/stable-diffusion-v1-5"          # swap to any SD1.x HF 
 inpainter_model: "runwayml/stable-diffusion-inpainting"  # swap to any SD-inpaint model
 
 # LoRA weights for the inpainter (set to null to skip loading LoRA)
-inpainter_lora_path: null          # e.g. "weights/inpainter_lora.safetensors"
+inpainter_lora_path: "weights/adapter_model.safetensors"         # e.g. "weights/inpainter_lora.safetensors"
 inpainter_lora_scale: 0.8
 
 auditor_weights: "complete_auditor_best.pth"
 auditor_vocab:   "vocab.json"
 
 # ── TSPO policy ──────────────────────────────────────────────────────────────
-use_tspo: false                    # false → vanilla hardcoded sweeps
-tspo_checkpoint: "weights/tspo_step00050.pth"   # ignored when use_tspo=false
+use_tspo: true                    # false → vanilla hardcoded sweeps
+tspo_checkpoint: "weights/tspo_step00100.pth"   # ignored when use_tspo=false
+encoder_checkpoint: "weights/state_enc_step00100.pth"
 
 # ── Reinsertion method ───────────────────────────────────────────────────────
 # SD0_DDPM | SD1_DDIM_FWD | SD2_DDIM_INV | SD3_NULL_TEXT
@@ -29,7 +30,7 @@ seed: 42
 
 # ── Audit schedule ───────────────────────────────────────────────────────────
 # Steps (0-indexed) at which to decode + audit during the last ~30% of diffusion
-audit_steps: [38, 44, 48]
+audit_steps: [32,36, 40, 44]
 
 # ── Guarded utility thresholds ───────────────────────────────────────────────
 delta: 0.01          # minimum policy_score margin over control
@@ -37,8 +38,8 @@ tau_P: 0.25          # minimum policy_score for a candidate to be accepted
 tau_F: 0.15          # minimum faithfulness for a candidate to be accepted
 
 # ── Inpainting ───────────────────────────────────────────────────────────────
-n_candidates: 4
-inpaint_steps: 20
+n_candidates: 5
+inpaint_steps: 50
 inpaint_prompt_mode: "safe"    # "safe" → scrub toxic words | "original" → keep
 
 noise_aware_mask: false        # weight heatmap by SNR at timestep t
@@ -53,4 +54,4 @@ null_lr: 0.01
 # ── Output ───────────────────────────────────────────────────────────────────
 results_dir: "results"
 save_images: true
-show_plots: false              # set true in Colab / Jupyter; false for headless runs
+show_plots: true              # set true in Colab / Jupyter; false for headless runs

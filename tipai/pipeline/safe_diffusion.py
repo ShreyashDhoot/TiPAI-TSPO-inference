@@ -18,9 +18,7 @@ Usage
 from __future__ import annotations
 
 import os
-import json
 from dataclasses import dataclass, field
-from typing import Any
 
 import numpy as np
 import torch
@@ -29,7 +27,7 @@ from PIL import Image
 
 from auditor.auditor import AdversarialAuditor
 from inpainting.inpainter import build_inpainter, run_inpainting
-from policy.tspo_policy import load_policy, get_knobs
+from policy.tspo_policy import load_policy, load_state_encoder, get_knobs
 from reinsertion.reinsertion import reinsert, decode_latents, pil_to_latent
 from tournament.winner import select_winner
 from utils.diffusion_utils import encode_prompt, build_mask, noise_aware_heatmap
@@ -90,7 +88,7 @@ class SafeDiffusionPipeline:
             model_id   = cfg["inpainter_model"],
             lora_path  = cfg.get("inpainter_lora_path"),
             lora_scale = cfg.get("inpainter_lora_scale", 0.8),
-            vae_from   = self.pipe.vae,   # share VAE → same latent space
+            vae_from   = self.pipe.vae,
             device     = self.device,
             dtype      = self.dtype,
         )
@@ -104,24 +102,33 @@ class SafeDiffusionPipeline:
         )
         print("  [Auditor] loaded.")
 
-        # 4. TSPO policy ──────────────────────────────────────────────────────
+        # 4. TSPO policy + StateEncoder ───────────────────────────────────────
+        # tspo_checkpoint    → policy MLP weights  (raw state_dict .pth)
+        # encoder_checkpoint → StateEncoder weights (separate file saved by
+        #                       training as state_enc_step{N:05d}.pth)
         if cfg.get("use_tspo", False):
-            self.policy = load_policy(cfg.get("tspo_checkpoint"), device=self.device)
+            self.policy        = load_policy(
+                cfg.get("tspo_checkpoint"), device=self.device
+            )
+            self.state_encoder = load_state_encoder(
+                cfg.get("encoder_checkpoint"), device=self.device
+            )
         else:
-            self.policy = None
+            self.policy        = None
+            self.state_encoder = None
+
         print(f"  [Policy] {'TSPO active' if self.policy else 'Vanilla sweep mode'}")
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def swap_base_model(self, model_id: str):
-        """Hot-swap the base SD model (e.g. to try a different SD1.x variant)."""
+        """Hot-swap the base SD model."""
         print(f"[SafeDiffusion] Swapping base model → {model_id}")
         self.pipe = StableDiffusionPipeline.from_pretrained(
             model_id, torch_dtype=self.dtype, use_safetensors=True
         ).to(self.device)
         self.pipe.scheduler = DDIMScheduler.from_config(self.pipe.scheduler.config)
         self.pipe.safety_checker = None
-        # keep shared VAE
         self.inpaint_pipe.vae = self.pipe.vae
 
     def swap_inpainter_lora(self, lora_path: str, lora_scale: float = 0.8):
@@ -137,10 +144,6 @@ class SafeDiffusionPipeline:
         ----------
         prompt : text prompt
         seed   : optional RNG seed (overrides config)
-
-        Returns
-        -------
-        GenerationResult
         """
         cfg    = self.cfg
         method = cfg.get("reinsertion_method", "SD3_NULL_TEXT")
@@ -159,11 +162,6 @@ class SafeDiffusionPipeline:
 
         text_emb = encode_prompt(self.pipe, prompt, self.device).to(dtype=self.dtype)
 
-        # prompt embedding for the policy (uses auditor's LSTM encoder)
-        with torch.no_grad():
-            toks = self.auditor.tokenizer.encode(prompt).unsqueeze(0).to(self.device)
-            prompt_embed, _, _ = self.auditor.model.text_encoder(toks)
-
         trajectory    = []
         first_pil     = None
         null_cache: dict = {}
@@ -172,7 +170,6 @@ class SafeDiffusionPipeline:
         # ── main denoising loop ───────────────────────────────────────────────
         for i, t in enumerate(timesteps):
             with torch.no_grad():
-                # SD3: use optimised null emb if available
                 if i in null_cache:
                     current_emb = torch.cat([null_cache[i], text_emb[-1:]])
                 else:
@@ -194,6 +191,8 @@ class SafeDiffusionPipeline:
             if first_pil is None:
                 first_pil = current_pil
 
+            # audit_pil now returns img_embed (256,) and text_embed (512,)
+            # alongside the standard fields — no CLIP needed
             res_0 = self.auditor.audit_pil(current_pil, prompt, t_norm)
 
             hmap = res_0["heatmap"]
@@ -225,14 +224,45 @@ class SafeDiffusionPipeline:
             )
 
             # ── TSPO knob generation ──────────────────────────────────────────
-            knobs = get_knobs(
-                policy       = self.policy,
-                audit_result = res_0,
-                t_norm       = t_norm,
-                harm_class   = res_0["harm_class"],
-                n            = cfg["n_candidates"],
-                device       = self.device,
-            )
+            if self.policy is not None and self.state_encoder is not None:
+                # All inputs come from the auditor — no CLIP, no extra models.
+
+                # img_embed  : (256,) from audit_pil  → unsqueeze to (1, 256)
+                # text_embed : (512,) from audit_pil  → unsqueeze to (1, 512)
+                img_embed  = res_0["img_embed"].unsqueeze(0).to(self.device)   # (1, 256)
+                text_embed = res_0["text_embed"].unsqueeze(0).to(self.device)  # (1, 512)
+
+                # mask_mean : scalar coverage of the inpaint region
+                mask_arr  = np.array(mask_pil.convert("L"), dtype=np.float32) / 255.0
+                mask_mean = torch.tensor([[mask_arr.mean()]], device=self.device)  # (1, 1)
+
+                # latent and timestep
+                latent_b = latents.to(self.device).float()                     # (1, 4, 64, 64)
+                t_t      = torch.tensor([[t_norm]], device=self.device)        # (1, 1)
+
+                with torch.no_grad():
+                    state_vec = self.state_encoder(
+                        text_embed,   # (1, 512)
+                        latent_b,     # (1, 4, 64, 64)
+                        img_embed,    # (1, 256)
+                        mask_mean,    # (1, 1)
+                        t_t,          # (1, 1)
+                    )  # → (1, 257)
+
+                knobs = get_knobs(
+                    policy = self.policy,
+                    state  = state_vec,
+                    n      = cfg["n_candidates"],
+                    device = self.device,
+                )
+            else:
+                # Vanilla sweep — policy or encoder not loaded
+                knobs = get_knobs(
+                    policy = None,
+                    state  = None,
+                    n      = cfg["n_candidates"],
+                    device = self.device,
+                )
 
             # ── generate candidates ───────────────────────────────────────────
             candidates:  list[Image.Image] = []
@@ -264,7 +294,7 @@ class SafeDiffusionPipeline:
             )
 
             # ── reinsert winner into trajectory ───────────────────────────────
-            if best_idx >= 0:   # a genuine winner was found
+            if best_idx >= 0:
                 latents = reinsert(
                     method       = method,
                     pipe         = self.pipe,
@@ -304,7 +334,6 @@ class SafeDiffusionPipeline:
             "seam_quality":    final_res["seam_quality"],
         }
 
-        # ── optional save ─────────────────────────────────────────────────────
         if cfg.get("save_images", False):
             os.makedirs(cfg.get("results_dir", "results"), exist_ok=True)
             slug = prompt[:40].replace(" ", "_").replace("/", "")
