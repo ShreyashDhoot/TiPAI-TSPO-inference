@@ -1,0 +1,56 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# TiPAI-TSPO  —  Master Config
+# Edit this file between runs. All paths are absolute or relative to repo root.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Models ───────────────────────────────────────────────────────────────────
+base_sd_model: "runwayml/stable-diffusion-v1-5"          # swap to any SD1.x HF id or local path
+inpainter_model: "runwayml/stable-diffusion-inpainting"  # swap to any SD-inpaint model
+
+# LoRA weights for the inpainter (set to null to skip loading LoRA)
+inpainter_lora_path: null          # e.g. "weights/inpainter_lora.safetensors"
+inpainter_lora_scale: 0.8
+
+auditor_weights: "complete_auditor_best.pth"
+auditor_vocab:   "vocab.json"
+
+# ── TSPO policy ──────────────────────────────────────────────────────────────
+use_tspo: false                    # false → vanilla hardcoded sweeps
+tspo_checkpoint: "weights/tspo_step00050.pth"   # ignored when use_tspo=false
+
+# ── Reinsertion method ───────────────────────────────────────────────────────
+# SD0_DDPM | SD1_DDIM_FWD | SD2_DDIM_INV | SD3_NULL_TEXT
+reinsertion_method: "SD3_NULL_TEXT"
+
+# ── Generation ───────────────────────────────────────────────────────────────
+total_steps: 50
+guidance_scale: 7.5
+seed: 42
+
+# ── Audit schedule ───────────────────────────────────────────────────────────
+# Steps (0-indexed) at which to decode + audit during the last ~30% of diffusion
+audit_steps: [38, 44, 48]
+
+# ── Guarded utility thresholds ───────────────────────────────────────────────
+delta: 0.01          # minimum policy_score margin over control
+tau_P: 0.25          # minimum policy_score for a candidate to be accepted
+tau_F: 0.15          # minimum faithfulness for a candidate to be accepted
+
+# ── Inpainting ───────────────────────────────────────────────────────────────
+n_candidates: 4
+inpaint_steps: 20
+inpaint_prompt_mode: "safe"    # "safe" → scrub toxic words | "original" → keep
+
+noise_aware_mask: false        # weight heatmap by SNR at timestep t
+mask_percentile: 65            # top-N% heatmap threshold for binary mask
+blend_feather_sigma: 5         # Gaussian feather radius on mask
+
+# ── Method-specific ──────────────────────────────────────────────────────────
+ddim_inv_steps: 10
+null_opt_steps: 10
+null_lr: 0.01
+
+# ── Output ───────────────────────────────────────────────────────────────────
+results_dir: "results"
+save_images: true
+show_plots: false              # set true in Colab / Jupyter; false for headless runs
