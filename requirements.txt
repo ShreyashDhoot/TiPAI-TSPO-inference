@@ -1,0 +1,9 @@
+diffusers
+transformers
+accelerate
+torch
+torchvision
+opencv-python-headless
+lpips
+peft
+pyyaml

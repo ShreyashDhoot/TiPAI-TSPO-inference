@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import torch
-from diffusers import StableDiffusionPipeline, DDIMScheduler
+from diffusers import StableDiffusionPipeline, DDIMScheduler, DiffusionPipeline
 from PIL import Image
 
 from auditor.auditor import AdversarialAuditor
@@ -76,9 +76,21 @@ class SafeDiffusionPipeline:
         cfg = self.cfg
 
         # 1. Base SD pipeline ─────────────────────────────────────────────────
-        self.pipe = StableDiffusionPipeline.from_pretrained(
-            cfg["base_sd_model"], torch_dtype=self.dtype, use_safetensors=True
-        ).to(self.device)
+        # self.pipe = StableDiffusionPipeline.from_pretrained(
+        #     cfg["base_sd_model"], torch_dtype=self.dtype, use_safetensors=True
+        # ).to(self.device)
+        is_sdxl = cfg.get("base_sd_model", "sd1") == "sdxl"
+
+        if is_sdxl:
+            self.pipe = DiffusionPipeline.from_pretrained(
+                cfg["base_sd_model"], torch_dtype=self.dtype, use_safetensors=True
+            ).to(self.device)
+        else:
+            self.pipe = StableDiffusionPipeline.from_pretrained(
+                cfg["base_sd_model"], torch_dtype=self.dtype, use_safetensors=True
+            ).to(self.device)
+
+        self.is_sdxl = is_sdxl
         self.pipe.scheduler = DDIMScheduler.from_config(self.pipe.scheduler.config)
         self.pipe.safety_checker = None
         print(f"  [Base] {cfg['base_sd_model']}")
@@ -155,12 +167,35 @@ class SafeDiffusionPipeline:
         audit_set = set(cfg["audit_steps"])
 
         gen     = torch.Generator(device=self.device).manual_seed(seed)
+        # latents = torch.randn(
+        #     (1, 4, 64, 64), device=self.device, dtype=self.dtype, generator=gen
+        # )
+
+        latent_channels = 4
+        latent_res = 128 if self.is_sdxl else 64  # SDXL 1024px → 128x128 latent
+
         latents = torch.randn(
-            (1, 4, 64, 64), device=self.device, dtype=self.dtype, generator=gen
-        )
+            (1, latent_channels, latent_res, latent_res),
+            device=self.device, dtype=self.dtype, generator=gen
+)
         latents = latents * self.pipe.scheduler.init_noise_sigma
 
-        text_emb = encode_prompt(self.pipe, prompt, self.device).to(dtype=self.dtype)
+        # text_emb = encode_prompt(self.pipe, prompt, self.device).to(dtype=self.dtype)
+
+        if self.is_sdxl:
+    # SDXL needs both sequence embeddings AND pooled embeddings
+            prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_embeds = \
+                self.pipe.encode_prompt(
+                    prompt=prompt,
+                    device=self.device,
+                    num_images_per_prompt=1,
+                    do_classifier_free_guidance=True,
+                )
+            text_emb = torch.cat([negative_prompt_embeds, prompt_embeds])
+            pooled_emb = torch.cat([negative_pooled_embeds, pooled_prompt_embeds])
+        else:
+            text_emb = encode_prompt(self.pipe, prompt, self.device).to(dtype=self.dtype)
+            pooled_emb = None
 
         trajectory    = []
         first_pil     = None
@@ -177,7 +212,21 @@ class SafeDiffusionPipeline:
 
                 li  = torch.cat([latents] * 2)
                 li  = self.pipe.scheduler.scale_model_input(li, t)
-                np_ = self.pipe.unet(li, t, encoder_hidden_states=current_emb).sample
+                # np_ = self.pipe.unet(li, t, encoder_hidden_states=current_emb).sample
+                if self.is_sdxl:
+    # SDXL UNet also needs added_cond_kwargs with pooled embeddings + resolution
+                    add_text_embeds = pooled_emb
+                    add_time_ids = torch.tensor(
+                        [[1024, 1024, 0, 0, 1024, 1024]] * 2,  # orig_size, crop_coords, target_size
+                        device=self.device, dtype=self.dtype
+                    )
+                    np_ = self.pipe.unet(
+                        li, t,
+                        encoder_hidden_states=current_emb,
+                        added_cond_kwargs={"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+                    ).sample
+                else:
+                    np_ = self.pipe.unet(li, t, encoder_hidden_states=current_emb).sample
                 u_n, c_n = np_.chunk(2)
                 np_     = u_n + cfg["guidance_scale"] * (c_n - u_n)
                 latents = self.pipe.scheduler.step(np_, t, latents).prev_sample
@@ -269,10 +318,29 @@ class SafeDiffusionPipeline:
             cand_scores: list[dict]        = []
 
             for knob in knobs:
+                # cand = run_inpainting(
+                #     inpaint_pipe  = self.inpaint_pipe,
+                #     base_pil      = current_pil,
+                #     mask_pil      = mask_pil,
+                #     prompt        = prompt,
+                #     harm_class    = res_0["harm_class"],
+                #     knob          = knob,
+                #     n_steps       = cfg.get("inpaint_steps", 20),
+                #     prompt_mode   = cfg.get("inpaint_prompt_mode", "safe"),
+                #     device        = self.device,
+                # )
+                if self.is_sdxl:
+    # Decode gives 1024px; SD1.5 inpainter needs 512px
+                    base_512  = current_pil.resize((512, 512), Image.LANCZOS)
+                    mask_512  = mask_pil.resize((512, 512),    Image.NEAREST)
+                else:
+                    base_512  = current_pil
+                    mask_512  = mask_pil
+
                 cand = run_inpainting(
                     inpaint_pipe  = self.inpaint_pipe,
-                    base_pil      = current_pil,
-                    mask_pil      = mask_pil,
+                    base_pil=base_512,
+                    mask_pil=mask_512,
                     prompt        = prompt,
                     harm_class    = res_0["harm_class"],
                     knob          = knob,
@@ -280,6 +348,10 @@ class SafeDiffusionPipeline:
                     prompt_mode   = cfg.get("inpaint_prompt_mode", "safe"),
                     device        = self.device,
                 )
+
+                if self.is_sdxl:
+                    # Resize inpainted result back up before re-encoding into SDXL latent space
+                    cand = cand.resize((1024, 1024), Image.LANCZOS)
                 res_c = self.auditor.audit_pil(cand, prompt, t_norm)
                 candidates.append(cand)
                 cand_scores.append(res_c)
