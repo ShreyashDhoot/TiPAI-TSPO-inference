@@ -189,6 +189,8 @@ def parse_args():
     p.add_argument("--lora",       default=None,
                                                 help="LoRA weights path (passed through to run.py)")
     p.add_argument("--lora-scale", type=float, default=0.8)
+    p.add_argument("--hf-token",    default=None,
+                        help="HuggingFace token for gated models (or set HF_TOKEN env)")
     p.add_argument("--skip-existing", action="store_true",
                                                 help="Skip prompts whose output image already exists")
     return p.parse_args()

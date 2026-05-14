@@ -23,6 +23,7 @@ import sys
 
 from utils.config_loader import load_config
 from pipeline.safe_diffusion import SafeDiffusionPipeline
+from utils.hf_auth import resolve_hf_token
 
 
 def parse_args():
@@ -34,6 +35,7 @@ def parse_args():
     p.add_argument("--lora",       default=None,              help="Path to inpainter LoRA weights")
     p.add_argument("--lora-scale", type=float, default=0.8,   help="LoRA merge scale")
     p.add_argument("--out",        default=None,              help="Output image path (overrides config)")
+    p.add_argument("--hf-token",  default=None,              help="HuggingFace token for gated models (overrides HF_TOKEN env var)")
     return p.parse_args()
 
 
@@ -48,8 +50,8 @@ def main():
         cfg["inpainter_lora_path"]  = args.lora
         cfg["inpainter_lora_scale"] = args.lora_scale
 
-    # Build pipeline
-    sdp = SafeDiffusionPipeline(cfg)
+    # Build pipeline (token resolved from --hf-token or HF_TOKEN env)
+    sdp = SafeDiffusionPipeline(cfg, hf_token=args.hf_token)
 
     # Generate
     result = sdp.generate(args.prompt, seed=args.seed)

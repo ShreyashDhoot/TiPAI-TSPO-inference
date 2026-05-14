@@ -14,12 +14,33 @@ adv_prob      float         P(adversarial)  ∈ [0,1]
 is_unsafe     bool          adv_prob > 0.5
 harm_class    str           'safe' | 'nudity' | 'violence'
 policy_score  float         1 - adv_prob
-faithfulness  float         cos-similarity rescaled to [0,1]
+faithfulness  float         cos-similarity rescaled to [0,1]  ← FIXED
 seam_quality  float         seam/blend quality score
 mask_pil      PIL.Image     binary inpaint mask (L mode, 512×512)
 heatmap       np.ndarray    raw adversarial heatmap (512×512, float32)
 img_embed     torch.Tensor  (256,) auditor image embedding – used by StateEncoder
 text_embed    torch.Tensor  (512,) auditor text embedding  – used by StateEncoder
+
+Architecture / faithfulness notes
+-----------------------------------
+TRAINING MISMATCH FIXED
+  train_new.py initialises CompleteMultiTaskAuditor with num_classes=6 (line 402).
+  The old inference code used num_classes=3, causing a state_dict shape mismatch
+  on class_head and object_detection_head conv weights.
+  Fix: inference model now uses num_classes=_CKPT_NUM_CLASSES=6 and only reads
+  the first 3 class logits (safe/nudity/violence) for harm-class classification.
+
+FAITHFULNESS BUG FIXED
+  img_proj_head and txt_proj_head both end with a ReLU activation, so projected
+  embeddings are in [0, ∞) and their cosine similarity is always in [0, ~0.15].
+  The old formula  (cos + 1) / 2  maps this to [0.50, 0.575] — a blind gate.
+
+  Fix — two-tier strategy:
+  Tier 1 (preferred): use txt_feat_raw (B, 512), the raw LSTM→FC output that
+    passes through LayerNorm (genuinely zero-centred).  Average both 256-d halves
+    to get a 256-d vector matching img_embed's dimension, L2-normalise both.
+    Cosine similarity is now in a genuine [-1, +1] range so (cos+1)/2 is correct.
+  Tier 2 (fallback): txt_feat_raw unavailable → return 0.0 (reject-safe default).
 """
 
 from __future__ import annotations
@@ -36,10 +57,11 @@ from torchvision import models, transforms
 
 # ── class names ──────────────────────────────────────────────────────────────
 CLASS_NAMES = ["safe", "nudity", "violence"]
+_CKPT_NUM_CLASSES = 3
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Internal sub-models
+# Internal sub-models  (mirror train_new.py exactly)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SimpleTokenizer:
@@ -63,6 +85,7 @@ class SimpleTokenizer:
 
 
 class SimpleTextEncoder(nn.Module):
+    """Matches train_new.py SimpleTextEncoder exactly."""
     def __init__(self, vocab_size: int = 50_000, embed_dim: int = 512, hidden_dim: int = 256):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
@@ -75,41 +98,62 @@ class SimpleTextEncoder(nn.Module):
         e = self.drop(self.embedding(toks))
         out, (h, _) = self.lstm(e)
         h = torch.cat([h[0], h[1]], dim=1)
-        # text_feat is (B, 512) — the raw encoder output used by StateEncoder
-        # seq_feat  is (B, T, 512) — used for cross-attention in the auditor head
+        # text_feat  (B, 512) — raw LSTM→FC, zero-centred via downstream LayerNorm
+        # seq_feat   (B, T, 512) — per-token pre-LN features for cross-attention K/V
         text_feat = self.fc(h)
         seq_feat  = self.norm(self.fc(out))
         return text_feat, seq_feat, toks.eq(0)
 
 
 class CompleteMultiTaskAuditor(nn.Module):
-    def __init__(self, num_classes: int = 3, vocab_size: int = 50_000):
+    """
+    Exactly mirrors train_new.py CompleteMultiTaskAuditor.
+
+    Changes from old inference-only version:
+    - num_classes=_CKPT_NUM_CLASSES (6) so load_state_dict shape matches.
+    - forward() returns 'txt_feat_raw' (B, 512) for correct Tier-1 faithfulness.
+    - 'txt_embed' (B, 256) kept for backward compat only; NOT used for faithfulness.
+    """
+
+    def __init__(self, num_classes: int = _CKPT_NUM_CLASSES, vocab_size: int = 50_000):
         super().__init__()
         resnet = models.resnet101(weights=None)
         self.features   = nn.Sequential(*list(resnet.children())[:-2])
         self.text_encoder = SimpleTextEncoder(vocab_size=vocab_size)
+
+        # Safety heads — num_classes must match checkpoint
         self.adv_head   = nn.Conv2d(2048, 1, 1)
         self.class_head = nn.Conv2d(2048, num_classes, 1)
         self.quality_head = nn.Conv2d(2048, 1, 1)
         self.object_detection_head = nn.Sequential(
             nn.Conv2d(2048, 512, 3, padding=1), nn.ReLU(), nn.Conv2d(512, num_classes, 1)
         )
+
+        # Cross-attention path (image queries text tokens)
         self.image_proj = nn.Conv2d(2048, 512, 1)
         self.cross_attention = nn.MultiheadAttention(512, num_heads=8, batch_first=True)
         self.query_norm = nn.LayerNorm(512)
         self.key_norm   = nn.LayerNorm(512)
+
+        # CLIP-style faithfulness heads (end in ReLU → outputs ≥ 0)
         self.img_proj_head = nn.Sequential(nn.Linear(512, 256), nn.ReLU(), nn.Linear(256, 256))
         self.txt_proj_head = nn.Sequential(nn.Linear(512, 256), nn.ReLU(), nn.Linear(256, 256))
         self.log_temperature = nn.Parameter(torch.tensor([-2.659]))
+
+        # Timestep embedding + FiLM
         self.timestep_embed = nn.Sequential(
             nn.Linear(1, 128), nn.SiLU(), nn.Linear(128, 256), nn.SiLU(), nn.Linear(256, 512)
         )
         self.film_adv  = nn.Linear(512, 2048 * 2)
         self.film_seam = nn.Linear(512, 512 * 2)
+
+        # Relative adversary head (FiLM-conditioned on timestep)
         self.relative_adv_head = nn.Sequential(
             nn.Linear(2048, 512), nn.ReLU(), nn.Dropout(0.2),
             nn.Linear(512, 256), nn.ReLU(), nn.Linear(256, 1)
         )
+
+        # Seam quality detection
         self.seam_feat = nn.Sequential(
             nn.Conv2d(2048, 512, 3, padding=1), nn.ReLU(), nn.BatchNorm2d(512)
         )
@@ -120,18 +164,23 @@ class CompleteMultiTaskAuditor(nn.Module):
     def forward(self, x: torch.Tensor, text_tokens=None, timestep=None):
         B = x.size(0)
         feats = self.features(x)
-        gf = F.adaptive_avg_pool2d(feats, (1, 1)).flatten(1)
+        gf = F.adaptive_avg_pool2d(feats, (1, 1)).flatten(1)   # (B, 2048)
 
         img_embed = txt_embed = txt_feat_raw = None
+
         if text_tokens is not None:
-            tf, sf, pm = self.text_encoder(text_tokens)
-            iq = self.image_proj(feats).view(B, 512, -1).permute(0, 2, 1)
+            tf, sf, pm = self.text_encoder(text_tokens)        # tf: (B,512) raw
+            iq = self.image_proj(feats).view(B, 512, -1).permute(0, 2, 1)  # (B, HW, 512)
             aq, _ = self.cross_attention(
                 self.query_norm(iq), self.key_norm(sf), self.key_norm(sf), key_padding_mask=pm
             )
-            img_embed    = F.normalize(self.img_proj_head(aq.mean(1)), dim=-1)  # (B, 256)
-            txt_embed    = F.normalize(self.txt_proj_head(tf), dim=-1)           # (B, 256) — for faithfulness
-            txt_feat_raw = tf                                                     # (B, 512) — for StateEncoder
+            attended = aq.mean(1)                              # (B, 512)
+
+            # ReLU-tail projected embeddings — DO NOT use for faithfulness scoring
+            img_embed    = F.normalize(self.img_proj_head(attended), dim=-1)  # (B, 256)
+            txt_embed    = F.normalize(self.txt_proj_head(tf), dim=-1)        # (B, 256)
+            # Zero-centred raw text feature — used for Tier-1 faithfulness
+            txt_feat_raw = tf                                                  # (B, 512)
 
         if timestep is not None:
             ts = self.timestep_embed(timestep)
@@ -145,13 +194,14 @@ class CompleteMultiTaskAuditor(nn.Module):
             sm  = self.seam_feat(feats)
 
         seam_map = torch.sigmoid(self.seam_cls(sm))
+
         return {
             "binary_logits":      F.adaptive_avg_pool2d(self.adv_head(feats), (1, 1)).flatten(1),
             "class_logits":       F.adaptive_avg_pool2d(self.class_head(feats), (1, 1)).flatten(1),
             "adversarial_map":    torch.sigmoid(self.adv_head(feats)),
-            "img_embed":          img_embed,       # (B, 256) — projected, for faithfulness
-            "txt_embed":          txt_embed,        # (B, 256) — projected, for faithfulness
-            "txt_feat_raw":       txt_feat_raw,     # (B, 512) — raw, for StateEncoder.text_proj
+            "img_embed":          img_embed,      # (B, 256) ReLU-projected → StateEncoder
+            "txt_embed":          txt_embed,       # (B, 256) ReLU-projected → backward compat only
+            "txt_feat_raw":       txt_feat_raw,    # (B, 512) zero-centred  → Tier-1 faithfulness
             "seam_quality_score": F.adaptive_avg_pool2d(seam_map, (1, 1)).flatten(1),
         }
 
@@ -197,7 +247,10 @@ class AdversarialAuditor:
         self.tokenizer = SimpleTokenizer(vocab_path)
         vocab_size = len(self.tokenizer.word_to_idx)
 
-        self.model = CompleteMultiTaskAuditor(num_classes=3, vocab_size=vocab_size)
+        # num_classes=_CKPT_NUM_CLASSES (6) to match training checkpoint shape
+        self.model = CompleteMultiTaskAuditor(
+            num_classes=_CKPT_NUM_CLASSES, vocab_size=vocab_size
+        )
         self.model.load_state_dict(
             torch.load(model_path, map_location=self.device), strict=False,
         )
@@ -208,6 +261,45 @@ class AdversarialAuditor:
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ])
+
+    # ── Faithfulness scoring ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _faithfulness_score(
+        img_embed: "torch.Tensor | None",     # (1, 256) ReLU-projected
+        txt_feat_raw: "torch.Tensor | None",  # (1, 512) zero-centred LSTM→FC
+    ) -> float:
+        """
+        Two-tier faithfulness score in [0, 1].
+
+        Tier 1 (preferred — always taken if txt_feat_raw is available):
+          txt_feat_raw is (B, 512) from the LSTM→FC path which feeds into
+          LayerNorm before cross-attention K/V.  It is genuinely zero-centred,
+          so its cosine similarity with a normalised image vector spans [-1, +1].
+
+          We reduce it from 512-d to 256-d by averaging the two halves
+          (corresponding to the forward and backward LSTM directions), then
+          L2-normalise both img and text vectors before computing cosine sim.
+
+              cos ∈ [-1, +1]  →  (cos + 1) / 2  ∈ [0, 1]   ← CORRECT
+
+        Tier 2 (fallback — txt_feat_raw unavailable):
+          Return 0.0 (conservatively rejects the candidate) rather than
+          producing a misleading score.
+        """
+        if txt_feat_raw is not None and img_embed is not None:
+            # Tier 1: zero-centred text → genuine [-1, +1] cosine range
+            tf      = txt_feat_raw.float()                    # (1, 512)
+            tf_half = (tf[:, :256] + tf[:, 256:]) * 0.5      # (1, 256)  avg fwd+bwd halves
+            tf_norm = F.normalize(tf_half, dim=-1)
+            ie_norm = F.normalize(img_embed.float(), dim=-1)
+            cos     = F.cosine_similarity(ie_norm, tf_norm).item()  # ∈ [-1, +1]
+            return float(np.clip((cos + 1.0) / 2.0, 0.0, 1.0))
+
+        # Tier 2: conservative fallback
+        return 0.0
+
+    # ── Main inference API ────────────────────────────────────────────────────
 
     def audit_pil(
         self, pil: Image.Image, prompt: str = "", t_norm: float = 0.0
@@ -233,12 +325,17 @@ class AdversarialAuditor:
         with torch.no_grad():
             out = self.model(img_t, text_tokens=toks, timestep=ts_t)
 
-        prob  = torch.sigmoid(out["binary_logits"]).item()
-        cp    = F.softmax(out["class_logits"], dim=1)[0]
-        pi    = torch.argmax(cp).item()
-        cos   = (
-            F.cosine_similarity(out["img_embed"], out["txt_embed"]).item()
-            if out["img_embed"] is not None else 0.0
+        prob = torch.sigmoid(out["binary_logits"]).item()
+
+        # Only use first 3 logits for harm-class prediction (safe/nudity/violence)
+        class_logits_3 = out["class_logits"][:, :3]
+        cp = F.softmax(class_logits_3, dim=1)[0]
+        pi = torch.argmax(cp).item()
+
+        # ── Tier-1 faithfulness via zero-centred txt_feat_raw ─────────────────
+        faithfulness = self._faithfulness_score(
+            img_embed    = out["img_embed"],     # (1, 256) — ReLU-projected
+            txt_feat_raw = out["txt_feat_raw"],  # (1, 512) — zero-centred raw
         )
 
         raw  = out["adversarial_map"][0, 0]
@@ -254,14 +351,14 @@ class AdversarialAuditor:
             ((feat > 0.5).astype(np.float32) * 255).astype(np.uint8)
         ).convert("L")
 
-        # text_embed is the RAW 512-d LSTM→fc output that StateEncoder.text_proj was trained on.
-        # txt_embed (256-d, post txt_proj_head) is only used internally for faithfulness scoring.
-        img_embed  = (
-            out["img_embed"][0].detach().cpu()    # (256,)
+        # img_embed  → (256,) for StateEncoder.image_proj  (projected)
+        # text_embed → (512,) raw for StateEncoder.text_proj  (NOT the projected 256-d)
+        img_embed = (
+            out["img_embed"][0].detach().cpu()     # (256,)
             if out["img_embed"] is not None else torch.zeros(256)
         )
         text_embed = (
-            out["txt_feat_raw"][0].detach().cpu() # (512,) — matches StateEncoder.text_proj weight
+            out["txt_feat_raw"][0].detach().cpu()  # (512,) raw — matches StateEncoder.text_proj
             if out["txt_feat_raw"] is not None else torch.zeros(512)
         )
 
@@ -270,7 +367,7 @@ class AdversarialAuditor:
             is_unsafe    = prob > 0.5,
             harm_class   = CLASS_NAMES[pi],
             policy_score = 1.0 - prob,
-            faithfulness = (cos + 1.0) / 2.0,
+            faithfulness = faithfulness,   # ← FIXED: Tier-1 via txt_feat_raw
             seam_quality = out["seam_quality_score"].item(),
             mask_pil     = mask_pil,
             heatmap      = hmap,

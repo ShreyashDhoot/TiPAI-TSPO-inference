@@ -3,55 +3,97 @@
 # Edit this file between runs. All paths are absolute or relative to repo root.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── Models ───────────────────────────────────────────────────────────────────
-base_sd_model: "runwayml/stable-diffusion-v1-5"          # swap to any SD1.x HF id or local path
-inpainter_model: "runwayml/stable-diffusion-inpainting"  # swap to any SD-inpaint model
+# ── HuggingFace Authentication ───────────────────────────────────────────────
+# Required for GATED models: SD 3.5 Large Turbo, SD 3.5 Medium.
+# Non-gated models (SD 1.x, SDXL) work without a token.
+#
+# Set your token via ONE of:
+#   1. Environment variable:  export HF_TOKEN=hf_...
+#   2. .env file in repo root: HF_TOKEN=hf_...
+#   3. CLI flag:              --hf-token hf_...
+#
+# After getting a token, accept the model license on HuggingFace:
+#   https://huggingface.co/stabilityai/stable-diffusion-3.5-large-turbo
+#   https://huggingface.co/stabilityai/stable-diffusion-3.5-medium
+#
+# hf_token in config is intentionally NOT supported — do not put secrets
+# in config files that get committed to version control.
 
-# LoRA weights for the inpainter (set to null to skip loading LoRA)
-inpainter_lora_path: "weights/adapter_model.safetensors"         # e.g. "weights/inpainter_lora.safetensors"
+# ── Base generator ────────────────────────────────────────────────────────────
+# Choose ONE of the supported model families:
+#
+#   SD 1.x : "runwayml/stable-diffusion-v1-5"               (512×512 output)
+#             "dreamlike-art/dreamlike-photoreal-2.0"        (any 1.x variant)
+#
+#   SD XL  : "stabilityai/stable-diffusion-xl-base-0.9"     (1024×1024 output)
+#
+#   SD 3.5 : "stabilityai/stable-diffusion-3.5-large-turbo" (1024×1024 output)
+#             "stabilityai/stable-diffusion-3.5-medium"      (1024×1024 output)
+#
+# The pipeline class is detected automatically from the model ID.
+# The inpainter ALWAYS uses its own independent VAE (never shared with the base
+# generator) to avoid latent-space mismatches across model families.
+base_sd_model: "stabilityai/stable-diffusion-3.5-medium"
+
+# ── Inpainter ─────────────────────────────────────────────────────────────────
+# Must be an SD-1.x inpainting checkpoint.
+# Images are automatically resized at the generator↔inpainter boundary.
+inpainter_model: "runwayml/stable-diffusion-inpainting"
+
+# LoRA weights for the inpainter (null = skip LoRA)
+inpainter_lora_path: null
 inpainter_lora_scale: 0.8
 
+# ── Auditor ───────────────────────────────────────────────────────────────────
 auditor_weights: "complete_auditor_best.pth"
 auditor_vocab:   "vocab.json"
 
-# ── TSPO policy ──────────────────────────────────────────────────────────────
-use_tspo: true                    # false → vanilla hardcoded sweeps
-tspo_checkpoint: "weights/tspo_step00100.pth"   # ignored when use_tspo=false
-encoder_checkpoint: "weights/state_enc_step00100.pth"
+# ── TSPO policy ───────────────────────────────────────────────────────────────
+use_tspo: true
+tspo_checkpoint:    "weights/tspo_step00800.pth"
+encoder_checkpoint: "weights/state_enc_step00800.pth"
 
-# ── Reinsertion method ───────────────────────────────────────────────────────
+# ── Reinsertion method ────────────────────────────────────────────────────────
 # SD0_DDPM | SD1_DDIM_FWD | SD2_DDIM_INV | SD3_NULL_TEXT
-reinsertion_method: "SD3_NULL_TEXT"
+# NOTE: SD3_NULL_TEXT and SD2_DDIM_INV are only supported for SD-1.x base.
+# For XL / SD-3.5 bases use SD0_DDPM (pixel-space blend) as a safe fallback.
+reinsertion_method: "SD2_DDIM_INV"
 
-# ── Generation ───────────────────────────────────────────────────────────────
+# ── Generation ────────────────────────────────────────────────────────────────
 total_steps: 50
 guidance_scale: 7.5
 seed: 42
 
-# ── Audit schedule ───────────────────────────────────────────────────────────
-# Steps (0-indexed) at which to decode + audit during the last ~30% of diffusion
-audit_steps: [32,36, 40, 44]
+# ── Audit schedule ────────────────────────────────────────────────────────────
+# Steps (0-indexed) at which to decode + audit during the last ~30% of diffusion.
+audit_steps: [32, 36, 40, 44]
 
-# ── Guarded utility thresholds ───────────────────────────────────────────────
-delta: 0.01          # minimum policy_score margin over control
-tau_P: 0.25          # minimum policy_score for a candidate to be accepted
-tau_F: 0.15          # minimum faithfulness for a candidate to be accepted
+# ── Guarded utility thresholds ────────────────────────────────────────────────
+delta: 0.01      # minimum policy_score margin over control
+tau_P: 0.25      # minimum policy_score for a candidate to be accepted
+# tau_F threshold is now meaningful: Tier-1 faithfulness spans [0, 1] after fix
+tau_F: 0.25      # minimum faithfulness (raised from 0.15 now that range is correct)
 
-# ── Inpainting ───────────────────────────────────────────────────────────────
+# ── Inpainting ────────────────────────────────────────────────────────────────
 n_candidates: 5
-inpaint_steps: 50
-inpaint_prompt_mode: "safe"    # "safe" → scrub toxic words | "original" → keep
+# inpaint_steps is now dynamically scaled per step (inpaint_steps_min/max below)
+inpaint_steps_min: 0
+inpaint_steps_max: 50
 
-noise_aware_mask: false        # weight heatmap by SNR at timestep t
-mask_percentile: 65            # top-N% heatmap threshold for binary mask
-blend_feather_sigma: 5         # Gaussian feather radius on mask
+# inpaint_prompt_mode is DEPRECATED — inpainter now receives no positive prompt.
+# Only a hard-coded negative prompt is used (see inpainting/inpainter.py).
+inpaint_prompt_mode: "none"
 
-# ── Method-specific ──────────────────────────────────────────────────────────
+noise_aware_mask: false
+mask_percentile: 65
+blend_feather_sigma: 5
+
+# ── Method-specific ───────────────────────────────────────────────────────────
 ddim_inv_steps: 10
 null_opt_steps: 10
 null_lr: 0.01
 
-# ── Output ───────────────────────────────────────────────────────────────────
+# ── Output ────────────────────────────────────────────────────────────────────
 results_dir: "results"
 save_images: true
-show_plots: true              # set true in Colab / Jupyter; false for headless runs
+show_plots: true

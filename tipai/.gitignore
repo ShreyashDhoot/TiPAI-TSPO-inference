@@ -26,3 +26,13 @@ Thumbs.db
 # IDE settings
 .vscode/
 .idea/
+
+#folder
+weights/
+results/
+weights/
+results/
+complete_auditor_best.pth
+batch_results.csv
+vocab.json
+sneak_prompt.json

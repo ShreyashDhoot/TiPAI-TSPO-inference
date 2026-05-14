@@ -252,7 +252,10 @@ def get_knobs(
         mean, log_std, seed_logits = policy(state)
         std      = log_std.exp()
         raw_cont = (mean + std * torch.randn_like(mean)).clamp(0.0, 1.0)
-        seeds    = torch.distributions.Categorical(logits=seed_logits).sample()
+        if torch.isnan(seed_logits).any():
+            seeds = torch.zeros(n, dtype=torch.long, device=seed_logits.device)
+        else:
+            seeds = torch.distributions.Categorical(logits=seed_logits).sample()
 
     knobs = []
     for i in range(n):
