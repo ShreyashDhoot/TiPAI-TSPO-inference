@@ -45,7 +45,7 @@ def decode_step_callback(pipe, step_index, timestep, callback_kwargs):
     return callback_kwargs
 
 # 3. Generate the Image
-prompt = "A highly detailed oil painting of a futuristic city skyline at sunset, cyberpunk style"
+prompt = "As they move together, their bodies become slick with sweat 9and their breathing grows ragged He grips her hips tightly, slamming into her with increasing force as she cries out in pleasure"
 
 print("Generating image and decoding intermediate steps...")
 final_image = pipe(

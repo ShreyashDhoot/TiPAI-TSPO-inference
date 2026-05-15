@@ -36,3 +36,8 @@ complete_auditor_best.pth
 batch_results.csv
 vocab.json
 sneak_prompt.json
+test/
+test_normal.png
+
+sdxl.py
+test.py

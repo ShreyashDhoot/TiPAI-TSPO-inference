@@ -33,7 +33,7 @@
 # The pipeline class is detected automatically from the model ID.
 # The inpainter ALWAYS uses its own independent VAE (never shared with the base
 # generator) to avoid latent-space mismatches across model families.
-base_sd_model: "stabilityai/stable-diffusion-3.5-medium"
+base_sd_model: "stabilityai/stable-diffusion-3.5-large-turbo"
 
 # ── Inpainter ─────────────────────────────────────────────────────────────────
 # Must be an SD-1.x inpainting checkpoint.
@@ -41,8 +41,8 @@ base_sd_model: "stabilityai/stable-diffusion-3.5-medium"
 inpainter_model: "runwayml/stable-diffusion-inpainting"
 
 # LoRA weights for the inpainter (null = skip LoRA)
-inpainter_lora_path: null
-inpainter_lora_scale: 0.8
+inpainter_lora_path: "weights/adapter_model.safetensors"
+inpainter_lora_scale: 1
 
 # ── Auditor ───────────────────────────────────────────────────────────────────
 auditor_weights: "complete_auditor_best.pth"
@@ -54,19 +54,31 @@ tspo_checkpoint:    "weights/tspo_step00800.pth"
 encoder_checkpoint: "weights/state_enc_step00800.pth"
 
 # ── Reinsertion method ────────────────────────────────────────────────────────
-# SD0_DDPM | SD1_DDIM_FWD | SD2_DDIM_INV | SD3_NULL_TEXT
-# NOTE: SD3_NULL_TEXT and SD2_DDIM_INV are only supported for SD-1.x base.
-# For XL / SD-3.5 bases use SD0_DDPM (pixel-space blend) as a safe fallback.
-reinsertion_method: "SD2_DDIM_INV"
+# SD0_DDPM      — DDPM noise schedule blend (SD1x/SDXL only; WRONG for SD3.5)
+# SD1_DDIM_FWD  — alpha-blend by t_norm (SD1x)
+# SD2_DDIM_INV  — DDIM inversion (SD1x)
+# SD3_NULL_TEXT — null-text inversion (SD1x/SDXL)
+# SD4_FLOW_INV  — forward flow ODE projection (SD3.5 / rectified flow ONLY)
+reinsertion_method: "SD3_NULL_TEXT"
 
 # ── Generation ────────────────────────────────────────────────────────────────
 total_steps: 50
-guidance_scale: 7.5
+guidance_scale: 4.5     # SD3.5 recommended (7.5 was for SD1x/SDXL)
 seed: 42
+
+# ── Flow inversion (SD4_FLOW_INV only) ───────────────────────────────────────
+# Number of Euler steps for forward ODE projection.
+# 10 is sufficient — rectified flow is a straight line so error is small.
+# Increase to 20-25 for higher accuracy at the cost of extra transformer calls.
+flow_inv_steps: 0              # keep what works
+flow_inv_hard_threshold: 0.25  # hard swap when t_norm < 0.25 (late audit steps)
+flow_inv_clean_threshold: 0.30 # redundant with steps=0, but correct for when you re-enable ODE
+flow_inv_sharpen: true
+# later steps = lower t_norm = harder swap = sharper
 
 # ── Audit schedule ────────────────────────────────────────────────────────────
 # Steps (0-indexed) at which to decode + audit during the last ~30% of diffusion.
-audit_steps: [32, 36, 40, 44]
+audit_steps: [44,49]
 
 # ── Guarded utility thresholds ────────────────────────────────────────────────
 delta: 0.01      # minimum policy_score margin over control
