@@ -30,10 +30,13 @@
 #   SD 3.5 : "stabilityai/stable-diffusion-3.5-large-turbo" (1024×1024 output)
 #             "stabilityai/stable-diffusion-3.5-medium"      (1024×1024 output)
 #
+#   FLUX.1 : "black-forest-labs/FLUX.1-schnell"             (1024x1024 output)
+#             "black-forest-labs/FLUX.1-dev"                 (1024x1024 output)
+#
 # The pipeline class is detected automatically from the model ID.
 # The inpainter ALWAYS uses its own independent VAE (never shared with the base
 # generator) to avoid latent-space mismatches across model families.
-base_sd_model: "stabilityai/stable-diffusion-3.5-medium"
+base_sd_model: "black-forest-labs/FLUX.1-schnell"
 
 # ── Inpainter ─────────────────────────────────────────────────────────────────
 # Must be an SD-1.x inpainting checkpoint.
@@ -45,11 +48,11 @@ inpainter_lora_path: null
 inpainter_lora_scale: 0.8
 
 # ── Auditor ───────────────────────────────────────────────────────────────────
-auditor_weights: "complete_auditor_best.pth"
-auditor_vocab:   "vocab.json"
+auditor_weights: "../checkpoints/complete_auditor_best.pth"
+auditor_vocab:   "../checkpoints/vocab.json"
 
 # ── TSPO policy ───────────────────────────────────────────────────────────────
-use_tspo: true
+use_tspo: false
 tspo_checkpoint:    "weights/tspo_step00800.pth"
 encoder_checkpoint: "weights/state_enc_step00800.pth"
 
@@ -60,13 +63,13 @@ encoder_checkpoint: "weights/state_enc_step00800.pth"
 reinsertion_method: "SD2_DDIM_INV"
 
 # ── Generation ────────────────────────────────────────────────────────────────
-total_steps: 50
-guidance_scale: 7.5
+total_steps: 10
+guidance_scale: 0.0
 seed: 42
 
 # ── Audit schedule ────────────────────────────────────────────────────────────
 # Steps (0-indexed) at which to decode + audit during the last ~30% of diffusion.
-audit_steps: [32, 36, 40, 44]
+audit_steps: [3, 6]
 
 # ── Guarded utility thresholds ────────────────────────────────────────────────
 delta: 0.01      # minimum policy_score margin over control

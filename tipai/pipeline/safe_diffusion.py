@@ -30,11 +30,13 @@ from utils.diffusion_utils import encode_prompt, build_mask, noise_aware_heatmap
 from utils.hf_auth import resolve_hf_token, check_gated
 
 
-ModelFamily = Literal["sd1x", "sdxl", "sd3x"]
+ModelFamily = Literal["sd1x", "sdxl", "sd3x", "flux"]
 
 
 def _detect_family(model_id: str) -> ModelFamily:
     lower = model_id.lower()
+    if any(k in lower for k in ("flux", "flux.1")):
+        return "flux"
     if any(k in lower for k in ("stable-diffusion-3", "sd3", "sd-3")):
         return "sd3x"
     if any(k in lower for k in ("xl", "sdxl")):
@@ -46,6 +48,7 @@ _NATIVE_RES: dict[ModelFamily, tuple[int, int]] = {
     "sd1x": (512, 512),
     "sdxl": (1024, 1024),
     "sd3x": (1024, 1024),
+    "flux": (1024, 1024),
 }
 
 
@@ -83,18 +86,41 @@ def _load_sd3x(model_id, dtype, device, token=None):
     return pipe
 
 
+def _load_flux(model_id, dtype, device, token=None):
+    from diffusers import FluxPipeline
+    import torch
+    check_gated(model_id, token)
+    pipe = FluxPipeline.from_pretrained(
+        model_id, torch_dtype=torch.bfloat16, token=token
+    )
+    pipe.enable_model_cpu_offload()
+    if hasattr(pipe, "vae") and pipe.vae is not None:
+        pipe.vae.enable_tiling()
+        pipe.vae.enable_slicing()
+    return pipe
+
+
 def _load_base_pipeline(model_id, dtype, device, token=None):
     family  = _detect_family(model_id)
-    loaders = {"sd1x": _load_sd1x, "sdxl": _load_sdxl, "sd3x": _load_sd3x}
+    loaders = {"sd1x": _load_sd1x, "sdxl": _load_sdxl, "sd3x": _load_sd3x, "flux": _load_flux}
     pipe    = loaders[family](model_id, dtype, device, token=token)
     print(f"  [Base] {model_id}  (family={family})")
     return pipe, family
 
 
-def _decode_pil(pipe, latents: torch.Tensor, family: ModelFamily) -> Image.Image:
+def _decode_pil(pipe, latents: torch.Tensor, family: ModelFamily, H: int = None, W: int = None) -> Image.Image:
     """Decode VAE latents to PIL. Clamps arr to [0,1] before uint8 cast to prevent
     NaN → black-pixel corruption that would propagate into the auditor embeddings."""
-    if family in ("sd3x", "sdxl"):
+    if family == "flux":
+        if H is None or W is None:
+            raise ValueError("H and W must be provided for flux _decode_pil")
+        latents_up = pipe._unpack_latents(latents, H, W, pipe.vae_scale_factor)
+        latents_up = (latents_up / pipe.vae.config.scaling_factor) + pipe.vae.config.shift_factor
+        out = pipe.vae.decode(latents_up).sample
+        out = (out / 2 + 0.5).clamp(0, 1)
+        arr = out[0].detach().permute(1, 2, 0).float().clamp(0.0, 1.0).cpu().numpy()
+        return Image.fromarray((arr * 255).astype(np.uint8))
+    elif family in ("sd3x", "sdxl"):
         out = pipe.vae.decode(latents / pipe.vae.config.scaling_factor).sample
         out = (out / 2 + 0.5).clamp(0, 1)
         # FIX: clamp float arr before cast — prevents RuntimeWarning + NaN pixels
@@ -130,6 +156,16 @@ def _encode_prompt_for_pipe(pipe, prompt, device, family, dtype):
             "negative_prompt_embeds": npe.to(dtype),
             "pooled_prompt_embeds": ppe.to(dtype),
             "negative_pooled_prompt_embeds": npp.to(dtype),
+        }
+    if family == "flux":
+        pe, ppe, txt_ids = pipe.encode_prompt(
+            prompt=prompt, prompt_2=prompt, device=device,
+            num_images_per_prompt=1, max_sequence_length=512,
+        )
+        return {
+            "prompt_embeds": pe.to(dtype),
+            "pooled_prompt_embeds": ppe.to(dtype),
+            "text_ids": txt_ids.to(dtype),
         }
     raise ValueError(f"Unknown family: {family}")
 
@@ -265,7 +301,7 @@ class SafeDiffusionPipeline:
     def __init__(self, cfg: dict, hf_token: str | None = None):
         self.cfg      = cfg
         self.device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.dtype    = torch.float32 if self.device.type == "cuda" else torch.float32
+        self.dtype    = torch.bfloat16 if self.device.type == "cuda" else torch.float32
         self.hf_token = resolve_hf_token(hf_token)
         print("[SafeDiffusion] Loading models …")
         self._load_models()
@@ -312,7 +348,7 @@ class SafeDiffusionPipeline:
         from inpainting.inpainter import swap_lora
         swap_lora(self.inpaint_pipe, lora_path, lora_scale)
 
-    def _run_base_step(self, latents, t, text_emb, cfg_scale):
+    def _run_base_step(self, latents, t, text_emb, cfg_scale, latent_image_ids=None):
         family = self.base_family
         pipe   = self.pipe
 
@@ -350,6 +386,24 @@ class SafeDiffusionPipeline:
             guided   = u_n + cfg_scale * (c_n - u_n)
             return pipe.scheduler.step(guided, t, latents).prev_sample
 
+        if family == "flux":
+            pe = text_emb["prompt_embeds"]
+            ppe = text_emb["pooled_prompt_embeds"]
+            text_ids = text_emb["text_ids"]
+            has_guidance = getattr(pipe.transformer.config, "guidance_embeds", False)
+            guidance = torch.full([1], cfg_scale, device=self.device, dtype=self.dtype).expand(latents.shape[0]) if has_guidance else None
+            np_ = pipe.transformer(
+                hidden_states=latents,
+                timestep=(t / 1000.0).expand(latents.shape[0]),
+                guidance=guidance,
+                pooled_projections=ppe,
+                encoder_hidden_states=pe,
+                txt_ids=text_ids,
+                img_ids=latent_image_ids,
+                return_dict=False,
+            )[0]
+            return pipe.scheduler.step(np_, t, latents, return_dict=False)[0]
+
         raise ValueError(f"Unknown family: {family}")
 
     def generate(self, prompt: str, seed: int | None = None) -> GenerationResult:
@@ -358,14 +412,36 @@ class SafeDiffusionPipeline:
         H, W   = self.base_res
         seed   = seed if seed is not None else cfg.get("seed", 42)
 
-        # Reinsertion method — only SD3_NULL_TEXT / DDIM methods allowed for sd1x/sdxl;
-        # force SD0_DDPM for sd3x (flow matching incompatible with DDIM inversion)
+        # Reinsertion method
         method = cfg.get("reinsertion_method", "SD3_NULL_TEXT")
-        if family == "sd3x" and method != "SD0_DDPM":
-            print(f"[SafeDiffusion] Forcing reinsertion_method=SD0_DDPM for family=sd3x")
+        if family in ("sd3x", "flux") and method != "SD0_DDPM":
+            print(f"[SafeDiffusion] Forcing reinsertion_method=SD0_DDPM for family={family}")
             method = "SD0_DDPM"
 
-        self.pipe.scheduler.set_timesteps(cfg["total_steps"], device=self.device)
+        gen = torch.Generator(device=self.device).manual_seed(seed)
+        latent_image_ids = None
+
+        if family == "flux":
+            sigmas = np.linspace(1.0, 1 / cfg["total_steps"], cfg["total_steps"])
+            num_channels_latents = self.pipe.transformer.config.in_channels // 4
+            latents, latent_image_ids = self.pipe.prepare_latents(
+                batch_size=1, num_channels_latents=num_channels_latents,
+                height=H, width=W, dtype=self.dtype, device=self.device,
+                generator=gen, latents=None,
+            )
+            image_seq_len = latents.shape[1]
+            from diffusers.pipelines.flux.pipeline_flux import calculate_shift
+            mu = calculate_shift(
+                image_seq_len,
+                self.pipe.scheduler.config.get("base_image_seq_len", 256),
+                self.pipe.scheduler.config.get("max_image_seq_len", 4096),
+                self.pipe.scheduler.config.get("base_shift", 0.5),
+                self.pipe.scheduler.config.get("max_shift", 1.15),
+            )
+            self.pipe.scheduler.set_timesteps(sigmas=sigmas, device=self.device, mu=mu)
+        else:
+            self.pipe.scheduler.set_timesteps(cfg["total_steps"], device=self.device)
+            
         timesteps = self.pipe.scheduler.timesteps
         audit_set = set(cfg["audit_steps"])
 
@@ -381,10 +457,11 @@ class SafeDiffusionPipeline:
         elif family == "sd3x":
             latent_c, latent_h, latent_w = 16, H // 8, W // 8
 
-        latents = torch.randn(
-            (1, latent_c, latent_h, latent_w),
-            device=self.device, dtype=self.dtype, generator=gen,
-        ) * self.pipe.scheduler.init_noise_sigma
+        if family != "flux":
+            latents = torch.randn(
+                (1, latent_c, latent_h, latent_w),
+                device=self.device, dtype=self.dtype, generator=gen,
+            ) * self.pipe.scheduler.init_noise_sigma
 
         text_emb = _encode_prompt_for_pipe(self.pipe, prompt, self.device, family, self.dtype)
 
@@ -397,7 +474,7 @@ class SafeDiffusionPipeline:
 
         for i, t in enumerate(timesteps):
             with torch.no_grad():
-                latents = self._run_base_step(latents, t, text_emb, cfg["guidance_scale"])
+                latents = self._run_base_step(latents, t, text_emb, cfg["guidance_scale"], latent_image_ids=latent_image_ids)
 
             # FIX 1: clamp latents after every UNet step to stop NaN propagation
             if torch.isnan(latents).any() or torch.isinf(latents).any():
@@ -408,7 +485,7 @@ class SafeDiffusionPipeline:
                 continue
 
             t_norm      = float(t.item()) / 1000.0
-            current_pil = _decode_pil(self.pipe, latents, family)
+            current_pil = _decode_pil(self.pipe, latents, family, H=H, W=W)
 
             # FIX 2: skip audit if decoded image is mostly black (NaN-origin artifact)
             arr_check = np.array(current_pil)
@@ -523,6 +600,9 @@ class SafeDiffusionPipeline:
             tournament_count += 1
 
             if best_idx >= 0:
+                cfg_pass = cfg.copy()
+                cfg_pass["H"] = H
+                cfg_pass["W"] = W
                 latents = reinsert(
                     method       = method,
                     pipe         = self.pipe,
@@ -532,7 +612,7 @@ class SafeDiffusionPipeline:
                     t_norm       = t_norm,
                     t_idx        = i,
                     text_emb     = text_emb,      # passed for all families; reinsert uses if needed
-                    cfg          = cfg,
+                    cfg          = cfg_pass,
                     null_cache   = null_cache,
                 )
 
@@ -545,14 +625,14 @@ class SafeDiffusionPipeline:
                 step_rec["intervened"] = True
                 step_rec["u_max"]      = utilities[best_idx]
                 res_after = self.auditor.audit_pil(
-                    _decode_pil(self.pipe, latents, family), prompt, t_norm
+                    _decode_pil(self.pipe, latents, family, H=H, W=W), prompt, t_norm
                 )
                 step_rec["adv_after"]    = res_after["adv_prob"]
                 step_rec["policy_after"] = res_after["policy_score"]
 
             trajectory.append(step_rec)
 
-        final_pil = _decode_pil(self.pipe, latents, family)
+        final_pil = _decode_pil(self.pipe, latents, family, H=H, W=W)
         final_res = self.auditor.audit_pil(final_pil, prompt, 0.0)
         ctrl_res  = self.auditor.audit_pil(first_pil or final_pil, prompt, 0.0)
 
